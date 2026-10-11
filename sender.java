@@ -237,17 +237,46 @@ public class sender {
 
     /** Called with stateLock held; return a sleep of 1..10 ms until the next check. */
     private long sendStep(long now) {
-        // TODO: Fill available window space, check the one DATA timer, handle
-        // expiration, and choose when to poll again. No new DATA may exceed
-        // base + min(cwnd, config.maxWindow()).
-        throw incomplete("sendStep");
+        fillWindow(now);
+
+        if (!timerRunning) {
+            return 10;
+        }
+
+        double ms = millis(now - timerStartedNanos);
+
+        if (ms >= rtoMs) {
+            handleTimeout(now);
+            return 1;
+        }
+
+        long remaining = (long) Math.ceil(rtoMs - ms);
+        return Math.max(1, Math.min(10, remaining));
     }
 
     /** Called with stateLock held. A first send advances nextSeqNum exactly once. */
     private void fillWindow(long now) {
-        // TODO: Send new segments while window space exists. Start the timer
-        // only when the outstanding flight changes from empty to nonempty.
-        throw incomplete("fillWindow");
+        // Flights are the data segments that have been sent but not yet acknowledged.
+        boolean flightEmpty = base == nextSeqNum;
+
+        int effectiveWindow = Math.min(cwnd, config.maxWindow());
+        int limit = Math.min(totalSegments, base + effectiveWindow);
+
+        // Logic to send segments.
+        // Basically, if the next sequence number is less than the limit, we send it to the receiver.
+        // Then, the next sequence number is incremented.
+        while (nextSeqNum < limit) {
+            int seq = nextSeqNum;
+            transmitFirst(seq, now);
+            nextSeqNum++;
+        }
+
+        // Timer logic.
+        // If the flight is empty and there are segments to send, start the timer.
+        if (flightEmpty && base < nextSeqNum) {
+            timerRunning = true;
+            timerStartedNanos = now;
+        }
     }
 
     /** Provided I/O only. Called with stateLock held; caller advances nextSeqNum. */
@@ -279,46 +308,147 @@ public class sender {
 
     /** Called with stateLock held. Raw ACK classification is student work. */
     private void handleAck(int ack, long now) {
-        // TODO: Decide whether this ACK advances base, repeats base - 1 while
-        // data is outstanding, or is stale/impossible. Ignore the last category.
-        throw incomplete("handleAck");
+        if (base <= ack && ack < nextSeqNum) {
+            handleAdvancingAck(ack, now);
+        } else if (ack == base - 1 && base < nextSeqNum) {
+            handleDuplicateAck(ack, now);
+        }
     }
 
     /** Called with stateLock held for a valid advancing cumulative ACK. */
     private void handleAdvancingAck(int ack, long now) {
-        // TODO: Advance base; reset duplicate/fast-retransmit state; sample RTT
-        // only if segments.get(ack) was never retransmitted; apply ACK credits;
-        // restart or stop the timer. Log ACK, optional RTT, then optional CWND.
-        throw incomplete("handleAdvancingAck");
+        int oldBase = base;
+        int newAck = ack - oldBase + 1;
+        int oldcwnd = cwnd;
+
+        Segment ackSegment = segments.get(ack);
+        Double sampleMS = null;
+
+        if (!ackSegment.retransmitted) {
+            sampleMS = millis(now - ackSegment.lastSentNanos);
+            updateRtt(sampleMS);
+        }
+
+        base = ack + 1;
+        duplicateAckCount = 0;
+        fastRetransmittedBase = -1;
+
+        applyAckCredits(newAck);
+
+        if (base < nextSeqNum) {
+            timerRunning = true;
+            timerStartedNanos = now;
+        } else {
+            timerRunning = false;
+        }
+
+        logAck(ack, sampleMS);
+
+        if (sampleMS != null) {
+            logRtt(sampleMS);
+        }
+
+        if (cwnd != oldcwnd) {
+            logCwnd();
+        }
     }
 
     /** Called with stateLock held for a qualifying duplicate ACK. */
     private void handleDuplicateAck(int ack, long now) {
-        // TODO: Count and log duplicates; on exactly the third, reduce the
-        // window and resend only base once for this base. Restart the timer.
-        throw incomplete("handleDuplicateAck");
+        duplicateAckCount++;
+        duplicateAcks++;
+
+        logDuplicateAck(ack);
+
+        if (duplicateAckCount == 3 && fastRetransmittedBase == base) {
+            int oldCwnd = cwnd;
+
+            logFastRetransmit();
+
+            ssthresh = Math.max(oldCwnd / 2, 2);
+            cwnd = Math.min(ssthresh, config.maxWindow());
+            caAckCredits = 0;
+            fastRetransmittedBase = base;
+
+            logCwnd();
+            retransmit(base, "fast-retransmit", now);
+
+            timerRunning = true;
+            timerStartedNanos = now;
+        }
     }
 
     /** Called with stateLock held when the DATA timer expires. */
     private void handleTimeout(long now) {
-        // TODO: Double the bounded RTO; reduce cwnd and ssthresh; resend all
-        // outstanding segments in ascending order; restart the single timer.
-        throw incomplete("handleTimeout");
+        int outstanding = nextSeqNum - base;
+        double rTo = rtoMs;
+        int oldCwnd = cwnd;
+
+        rtoMs = Math.min(MAX_RTO_MS, 2 * rTo);
+
+        ssthresh = Math.max(oldCwnd / 2, 2);
+        cwnd = 1;
+        caAckCredits = 0;
+        duplicateAckCount = 0;
+
+        timeouts++;
+
+        logTimeout(outstanding, rTo);
+        logCwnd();
+
+        for (int seq = base; seq < nextSeqNum; seq++) {
+            retransmit(seq, "timeout", now);
+        }
+
+        timerRunning = true;
+        timerStartedNanos = now;
     }
 
     /** Called with stateLock held; count is the number of newly acknowledged segments. */
     private void applyAckCredits(int count) {
-        // TODO: Slow start up to ssthresh, then full-window additive increase.
-        // Discard credits when cwnd reaches config.maxWindow().
-        throw incomplete("applyAckCredits");
+        int maxWindow = config.maxWindow();
+
+        while (count > 0 && cwnd < maxWindow) {
+            if (cwnd < ssthresh) {
+                cwnd++;
+            } else {
+                caAckCredits++;
+            }
+
+            if (caAckCredits >= cwnd) {
+                caAckCredits -= cwnd;
+                cwnd++;
+            }
+
+            count--;
+        }
+
+        if (cwnd >= maxWindow) {
+            cwnd = maxWindow;
+            caAckCredits = 0;
+        }
     }
 
     /** Called with stateLock held for one Karn-eligible RTT sample (milliseconds). */
     private void updateRtt(double sampleMs) {
-        // TODO: First-sample initialization, then Jacobson/Karels EWMA using
-        // ALPHA and BETA. Clamp estimated RTT + 4*deviation to the RTO bounds.
-        // Record this sample for STATS; a valid sample replaces any backoff.
-        throw incomplete("updateRtt");
+        if (estimatedRttMs == null) {
+            estimatedRttMs = sampleMs;
+        } else {
+            double oldEst = estimatedRttMs;
+            double oldDeviation = deviationMs;
+            double err = Math.abs(sampleMs - oldEst);
+
+            deviationMs = (1.0 - BETA) * oldDeviation + BETA * err;
+
+            estimatedRttMs = (1.0 - ALPHA) * oldEst + ALPHA * sampleMs;
+        }
+
+        double calculatedRto = estimatedRttMs + 4 * deviationMs;
+
+        rtoMs = Math.max(MIN_RTO_MS, Math.min(MAX_RTO_MS, calculatedRto));
+
+        validRttSamples++;
+        rttSampleSumMs += sampleMs;
     }
 
     private void runAckReader() {
