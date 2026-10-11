@@ -360,7 +360,7 @@ public class sender {
 
         logDuplicateAck(ack);
 
-        if (duplicateAckCount == 3 && fastRetransmittedBase == base) {
+        if (duplicateAckCount == 3 && fastRetransmittedBase != base) {
             int oldCwnd = cwnd;
 
             logFastRetransmit();
@@ -371,7 +371,7 @@ public class sender {
             fastRetransmittedBase = base;
 
             logCwnd();
-            retransmit(base, "fast-retransmit", now);
+            retransmit(base, "fast_retransmit", now);
 
             timerRunning = true;
             timerStartedNanos = now;
@@ -433,6 +433,7 @@ public class sender {
     private void updateRtt(double sampleMs) {
         if (estimatedRttMs == null) {
             estimatedRttMs = sampleMs;
+            deviationMs = sampleMs / 2.0;
         } else {
             double oldEst = estimatedRttMs;
             double oldDeviation = deviationMs;
