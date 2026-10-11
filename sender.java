@@ -237,19 +237,24 @@ public class sender {
 
     /** Called with stateLock held; return a sleep of 1..10 ms until the next check. */
     private long sendStep(long now) {
+        // Send segments.
         fillWindow(now);
 
+        // No outstanding data is timed, so wait 10 ms before checking again.
         if (!timerRunning) {
             return 10;
         }
 
+        // how long has the timer been running? convert ns to ms.
         double ms = millis(now - timerStartedNanos);
 
+        // if the time reached the RTO (retransmission timeout). If yes, then handleTimeout performs timeout recovery
         if (ms >= rtoMs) {
             handleTimeout(now);
             return 1;
         }
 
+        // otherwise, return the remaining time until the RTO is reached.
         long remaining = (long) Math.ceil(rtoMs - ms);
         return Math.max(1, Math.min(10, remaining));
     }
@@ -308,6 +313,9 @@ public class sender {
 
     /** Called with stateLock held. Raw ACK classification is student work. */
     private void handleAck(int ack, long now) {
+        // sends ack to the appropriate ack handler.
+        // If ack covers a segment that has been sent but not yet acknowledged, handle it as an advancing ACK.
+        // If ack is a duplicate ACK, handle it accordingly.
         if (base <= ack && ack < nextSeqNum) {
             handleAdvancingAck(ack, now);
         } else if (ack == base - 1 && base < nextSeqNum) {
@@ -324,17 +332,21 @@ public class sender {
         Segment ackSegment = segments.get(ack);
         Double sampleMS = null;
 
+        // If the ACK is for a segment that has not been retransmitted, update the RTT.
         if (!ackSegment.retransmitted) {
             sampleMS = millis(now - ackSegment.lastSentNanos);
             updateRtt(sampleMS);
         }
 
+        // Move oldest unacknowledged segment to the next position. Reset duplicate and fast-retransmit state.
         base = ack + 1;
         duplicateAckCount = 0;
         fastRetransmittedBase = -1;
 
+        // adjust the congestion window based on new number of ACKed segments
         applyAckCredits(newAck);
 
+        // Restart the timer if there are outstanding segments.
         if (base < nextSeqNum) {
             timerRunning = true;
             timerStartedNanos = now;
@@ -355,11 +367,14 @@ public class sender {
 
     /** Called with stateLock held for a qualifying duplicate ACK. */
     private void handleDuplicateAck(int ack, long now) {
+        // Tracks consecutive duplicate ACKs
         duplicateAckCount++;
         duplicateAcks++;
 
+        // record the duplicate
         logDuplicateAck(ack);
 
+        // When the count reaches 3 and the base hasnt already been fast-transmitted.
         if (duplicateAckCount == 3 && fastRetransmittedBase != base) {
             int oldCwnd = cwnd;
 
@@ -384,8 +399,10 @@ public class sender {
         double rTo = rtoMs;
         int oldCwnd = cwnd;
 
+        // Update the RTO based on the timeout
         rtoMs = Math.min(MAX_RTO_MS, 2 * rTo);
 
+        // Update the congestion window and slow start threshold
         ssthresh = Math.max(oldCwnd / 2, 2);
         cwnd = 1;
         caAckCredits = 0;
@@ -396,6 +413,7 @@ public class sender {
         logTimeout(outstanding, rTo);
         logCwnd();
 
+        // Retransmit all outstanding segments
         for (int seq = base; seq < nextSeqNum; seq++) {
             retransmit(seq, "timeout", now);
         }
@@ -408,6 +426,7 @@ public class sender {
     private void applyAckCredits(int count) {
         int maxWindow = config.maxWindow();
 
+        // Adjust the congestion window based on the number of newly acknowledged segments
         while (count > 0 && cwnd < maxWindow) {
             if (cwnd < ssthresh) {
                 cwnd++;
